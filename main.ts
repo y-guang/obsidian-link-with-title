@@ -1,134 +1,129 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, getLinkpath, Plugin } from 'obsidian';
+import { syntaxTree } from '@codemirror/language';
+import { RangeSetBuilder } from '@codemirror/state';
+import * as fs from 'fs';
+import {
+	Decoration,
+	DecorationSet,
+	EditorView,
+	PluginSpec,
+	PluginValue,
+	ViewPlugin,
+	ViewUpdate,
+	WidgetType,
+} from '@codemirror/view';
 
-// Remember to rename these classes and interfaces!
+let staticApp: App;
+let headingCache: Record<string, string> = {};
 
-interface MyPluginSettings {
-	mySetting: string;
+class DynamicSuffixWidget extends WidgetType {
+	private linkContent: string;
+	private suffix: string;
+
+	constructor(linkContent: string, suffix: string) {
+		super();
+		this.linkContent = linkContent;
+		this.suffix = suffix;
+	}
+
+	toDOM(view: EditorView): HTMLElement {
+		const div = document.createElement('span');
+		div.innerText = `${this.suffix}: `;
+		div.addClass('cm-hmd-internal-link')
+		return div;
+	}
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+class DynamicSuffixPlugin implements PluginValue {
+	decorations: DecorationSet;
+	constructor(view: EditorView) {
+		this.decorations = this.buildDecorations(view);
+	}
+
+	update(update: ViewUpdate) {
+		if (update.docChanged || update.viewportChanged) {
+			this.decorations = this.buildDecorations(update.view);
+		}
+	}
+
+	destroy() { }
+
+	buildDecorations(view: EditorView): DecorationSet {
+		const builder = new RangeSetBuilder<Decoration>();
+
+		for (const { from, to } of view.visibleRanges) {
+			syntaxTree(view.state).iterate({
+				from,
+				to,
+				enter: (node) => {
+					if (node.type.name.startsWith('hmd-internal-link')) {
+						const linkText = view.state.doc.sliceString(node.from, node.to);
+						const linkPath = getLinkpath(linkText);
+						const file = staticApp.metadataCache.getFirstLinkpathDest(linkPath, '');
+
+						if (!file) return;
+
+						try {
+							// eslint-disable-next-line @typescript-eslint/no-explicit-any
+							const fullPath = (staticApp.vault.adapter as any).getFullPath(file.path);
+							let heading = headingCache[fullPath];
+							if (heading === undefined) {  // Check cache
+								const content = fs.readFileSync(fullPath, 'utf8');
+								heading = content.split('\n').slice(0, 30).find((line) => line.startsWith('# ')) || '';
+								if (heading) {
+									heading = heading.substring(2).trim();
+								}
+								headingCache[fullPath] = heading || '';  
+							}
+
+							if (heading) {  // Only create decoration if heading exists
+								builder.add(
+									node.from,
+									node.from,
+									Decoration.replace({
+										widget: new DynamicSuffixWidget(linkText, heading),
+									})
+								);
+							}
+						} catch (error) {
+							console.error('Error reading file:', error);
+						}
+					}
+				},
+			});
+		}
+		return builder.finish();
+	}
 }
+
+const pluginSpec: PluginSpec<DynamicSuffixPlugin> = {
+	decorations: (value: DynamicSuffixPlugin) => value.decorations,
+};
+
+export const dynamicSuffixPlugin = ViewPlugin.fromClass(
+	DynamicSuffixPlugin,
+	pluginSpec
+);
+
+export const createDynamicSuffixPlugin = (app: App) => {
+	staticApp = app;
+	return ViewPlugin.fromClass(DynamicSuffixPlugin, {
+		decorations: v => v.decorations,
+	});
+};
 
 export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
-
 	async onload() {
-		await this.loadSettings();
-
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
-
-		// This adds a simple command that can be triggered anywhere
+		this.registerEditorExtension(createDynamicSuffixPlugin(this.app));
 		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
+			id: 'reload-file-headings',
+			name: 'Reload file headings',
 			callback: () => {
-				new SampleModal(this.app).open();
+				headingCache = {};
 			}
 		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
 	}
 
 	onunload() {
-
-	}
-
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
-
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
-
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
-
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
-
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
-
-	display(): void {
-		const {containerEl} = this;
-
-		containerEl.empty();
-
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
 	}
 }
